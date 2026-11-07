@@ -1,0 +1,110 @@
+name: Build signed dnstt Release APKs
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out Android source
+        uses: actions/checkout@v7
+
+      - name: Check out pinned dnstt submodule over HTTPS
+        shell: bash
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          git submodule status
+
+      - name: Set up Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: app/src/main/go/dnstt/go.mod
+          cache-dependency-path: app/src/main/go/dnstt/go.sum
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install required Android packages
+        shell: bash
+        run: |
+          sdkmanager --install \
+            'platforms;android-35' \
+            'build-tools;35.0.0' \
+            'ndk;27.2.12479018'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build unsigned Release APKs
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          rm -rf app/build/go
+          ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Sign and verify Release APKs
+        shell: bash
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$KEYSTORE_B64" || -z "$KEYSTORE_PASSWORD" ]]; then
+            echo 'Missing ANDROID_RELEASE_KEYSTORE_B64 or ANDROID_RELEASE_PASSWORD GitHub Actions secret.' >&2
+            exit 1
+          fi
+          keystore="$RUNNER_TEMP/dnstt-release.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+
+          # This workflow expects a PKCS12/JKS keystore with alias 'dnstt'
+          # and the same password for both the keystore and its key.
+          keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias dnstt > /dev/null
+
+          build_tools="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p signed-release-apks
+          shopt -s nullglob
+          unsigned_apks=(app/build/outputs/apk/release/*-unsigned.apk)
+          if (( ${#unsigned_apks[@]} == 0 )); then
+            echo 'No unsigned Release APKs found.' >&2
+            exit 1
+          fi
+          for unsigned in "${unsigned_apks[@]}"; do
+            base="$(basename "$unsigned" -unsigned.apk)"
+            aligned="$RUNNER_TEMP/${base}-aligned.apk"
+            signed="signed-release-apks/${base}.apk"
+            "$build_tools/zipalign" -f -p 4 "$unsigned" "$aligned"
+            "$build_tools/apksigner" sign \
+              --ks "$keystore" \
+              --ks-key-alias dnstt \
+              --ks-pass env:KEYSTORE_PASSWORD \
+              --key-pass env:KEYSTORE_PASSWORD \
+              --out "$signed" \
+              "$aligned"
+            "$build_tools/apksigner" verify --verbose "$signed"
+          done
+          ls -lh signed-release-apks/*.apk
+
+      - name: Upload signed Release APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnstt-release-apks
+          path: signed-release-apks/*.apk
+          if-no-files-found: error
+          retention-days: 30

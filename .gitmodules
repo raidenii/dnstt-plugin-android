@@ -1,3 +1,4 @@
 [submodule "app/src/main/go/dnstt"]
 	path = app/src/main/go/dnstt
-	url = git@github.com:Mygod/dnstt.git
+	url = https://github.com/raidenii/dnstt.git
+	branch = android-sync
