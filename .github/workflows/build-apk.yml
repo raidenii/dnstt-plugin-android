@@ -1,12 +1,13 @@
-name: Build signed dnstt Release APKs
+name: Build and release dnstt Android APKs
 
 on:
   push:
     branches: [master]
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -24,6 +25,31 @@ jobs:
           git submodule sync --recursive
           git submodule update --init --recursive
           git submodule status
+
+      - name: Determine version
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle_version="$(sed -nE 's/^[[:space:]]*versionName = "([^"]+)".*/\1/p' app/build.gradle.kts | head -n1)"
+          gradle_code="$(sed -nE 's/^[[:space:]]*versionCode = ([0-9]+).*/\1/p' app/build.gradle.kts | head -n1)"
+          if [[ -z "$gradle_version" || -z "$gradle_code" ]]; then
+            echo 'Could not read versionName/versionCode from app/build.gradle.kts.' >&2
+            exit 1
+          fi
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ "$version" != "$gradle_version" ]]; then
+              echo "Tag version ($version) does not match Gradle versionName ($gradle_version)." >&2
+              exit 1
+            fi
+          else
+            version="$gradle_version"
+          fi
+
+          echo "VERSION_NAME=$version" >> "$GITHUB_ENV"
+          echo "Android versionName: $version"
+          echo "Android versionCode: $gradle_code"
 
       - name: Set up Java
         uses: actions/setup-java@v6
@@ -58,7 +84,7 @@ jobs:
           rm -rf app/build/go
           ./gradlew --no-daemon :app:assembleRelease
 
-      - name: Sign and verify Release APKs
+      - name: Sign, verify, and rename Release APKs
         shell: bash
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_RELEASE_KEYSTORE_B64 }}
@@ -69,42 +95,75 @@ jobs:
             echo 'Missing ANDROID_RELEASE_KEYSTORE_B64 or ANDROID_RELEASE_PASSWORD GitHub Actions secret.' >&2
             exit 1
           fi
+
           keystore="$RUNNER_TEMP/dnstt-release.jks"
           printf '%s' "$KEYSTORE_B64" | base64 --decode > "$keystore"
           chmod 600 "$keystore"
 
-          # This workflow expects a PKCS12/JKS keystore with alias 'dnstt'
-          # and the same password for both the keystore and its key.
+          # The keystore must contain alias 'dnstt'; key and store passwords match.
           keytool -list -keystore "$keystore" -storepass "$KEYSTORE_PASSWORD" -alias dnstt > /dev/null
 
           build_tools="$ANDROID_HOME/build-tools/35.0.0"
-          mkdir -p signed-release-apks
+          mkdir -p release-apks
           shopt -s nullglob
           unsigned_apks=(app/build/outputs/apk/release/*-unsigned.apk)
           if (( ${#unsigned_apks[@]} == 0 )); then
             echo 'No unsigned Release APKs found.' >&2
+            find app/build/outputs/apk -type f -name '*.apk' -print || true
             exit 1
           fi
+
           for unsigned in "${unsigned_apks[@]}"; do
             base="$(basename "$unsigned" -unsigned.apk)"
+            abi="${base#app-}"
+            abi="${abi%-release}"
+            case "$abi" in
+              arm64-v8a|armeabi-v7a|x86|x86_64) ;;
+              *)
+                echo "Unrecognized ABI in APK filename: $unsigned" >&2
+                exit 1
+                ;;
+            esac
+
             aligned="$RUNNER_TEMP/${base}-aligned.apk"
-            signed="signed-release-apks/${base}.apk"
+            output="release-apks/dnstt-plugin-android-${VERSION_NAME}-${abi}.apk"
             "$build_tools/zipalign" -f -p 4 "$unsigned" "$aligned"
             "$build_tools/apksigner" sign \
               --ks "$keystore" \
               --ks-key-alias dnstt \
               --ks-pass env:KEYSTORE_PASSWORD \
               --key-pass env:KEYSTORE_PASSWORD \
-              --out "$signed" \
+              --out "$output" \
               "$aligned"
-            "$build_tools/apksigner" verify --verbose "$signed"
+            "$build_tools/apksigner" verify --verbose "$output"
           done
-          ls -lh signed-release-apks/*.apk
 
-      - name: Upload signed Release APKs
+          echo 'Release APKs:'
+          ls -lh release-apks/*.apk
+
+      - name: Upload APK build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dnstt-release-apks
-          path: signed-release-apks/*.apk
+          name: dnstt-plugin-android-${{ env.VERSION_NAME }}
+          path: release-apks/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          title="dnstt-plugin-android ${VERSION_NAME}"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-apks/*.apk --clobber
+            gh release edit "$tag" --title "$title"
+          else
+            gh release create "$tag" release-apks/*.apk \
+              --title "$title" \
+              --generate-notes
+          fi
